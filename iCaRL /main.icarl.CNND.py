@@ -49,6 +49,13 @@ def get_val_opt():
     return val_opt
 
 
+def save_path(opt, save_filename):
+    opt.save_dir = os.path.join(opt.checkpoints_dir, opt.name)
+    save_p = os.path.join(opt.save_dir, save_filename)
+    # serialize model and optimizer to dict
+
+    return save_p
+
 def main():
     # This script tries to reproduce results of official iCaRL code
     # https://github.com/srebuffi/iCaRL/blob/master/iCaRL-TheanoLasagne/main_cifar_100_theano.py
@@ -142,5 +149,293 @@ def main():
 
     # Lines 90-97: Initialization of the variables for this run
     # dictionary_size = 500 ###????
-    
+    top1_acc_list_cumul = torch.zeros(task_num, 3, task_num)
+    top1_acc_list_ori = torch.zeros(task_num, 3, task_num)
 
+    x_protoset_cumuls: List[Tensor] = []
+    y_protoset_cumuls: List[Tensor] = []
+    # alpha_dr_herding = torch.zeros((task_num, dictionary_size, nb_cl), dtype=torch.float) ###???
+    alpha_dr_herding_list = []
+    dictionary_size_list = []
+    # Lines 101-103: already managed by NCProtocol/NCProtocolIterator
+
+
+    # train_dataset: Dataset
+    # task_info: NCProtocolIterator
+
+    func_pred: Callable[[Tensor], Tensor]
+    # func_pred_feat: Callable[[Tensor], Tensor] # Unused
+    # for task_idx in range(len(task_names)):
+    #     train_name = task_names[task_idx]
+    #     print('======================', train_name,
+    #           '=======================')
+    #     data_size = train_dataset_splits[train_name].__len__()
+    #     print("Training Size: ", data_size)
+    #     print('Iteration: ', task_idx)
+    for task_idx, (train_dataset, task_info) in enumerate(protocol):
+
+        print('Classes in this batch:', task_info.classes_in_this_task)
+        print('Data Size:', len(train_dataset))
+        dictionary_size = int(len(train_dataset)/2) ###????
+        dictionary_size_list.append(dictionary_size)
+        alpha_dr_herding_task = torch.zeros((dictionary_size, nb_cl), dtype=torch.float) ###???
+        alpha_dr_herding_list.append(alpha_dr_herding_task)
+
+        # if task_idx == 0:
+            
+        #     alpha_dr_herding = alpha_dr_herding_task
+        # else:
+        #     alpha_dr_herding = torch.stack((alpha_dr_herding,alpha_dr_herding_task))
+        # Lines 107, 108: Save data results at each increment
+        # torch.save(top1_acc_list_cumul, 'top1_acc_list_cumul_icarl_cl' + str(nb_cl))
+        # torch.save(top1_acc_list_ori, 'top1_acc_list_ori_icarl_cl' + str(nb_cl))
+        save_p_list_cul = save_path(args,'top1_acc_list_cumul_icarl_cl' + str(nb_cl))
+        save_p_list_ori = save_path(args,'top1_acc_list_ori_icarl_cl' + str(nb_cl))
+        torch.save(top1_acc_list_cumul, save_p_list_cul)
+        torch.save(top1_acc_list_ori, save_p_list_ori)
+
+        # Note: lines 111-125 already managed in NCProtocol/NCProtocolIterator
+
+        # Lines 128-135: Add the stored exemplars to the training data
+        # Note: X_valid_ori and Y_valid_ori already managed in NCProtocol/NCProtocolIterator
+        # train_dataset = train_dataset_splits[train_name]
+        # if task_idx != 0:
+        #     protoset = TensorDataset(torch.cat(x_protoset_cumuls), torch.cat(y_protoset_cumuls))
+        #     train_dataset = apd_name(args,train_name,train_dataset, protoset)
+
+        # train_loader = torch.utils.data.DataLoader(train_dataset,
+        #                                            batch_size=args.batch_size, shuffle=True,
+        #                                            num_workers=int(args.num_threads))
+        # test_loader = torch.utils.data.DataLoader(val_dataset_splits[train_name],
+        #                                          batch_size=args.batch_size, shuffle=False,
+        #                                          num_workers=int(args.num_threads))
+        # Note: X_valid_ori and Y_valid_ori already managed in NCProtocol/NCProtocolIterator
+        if task_idx != 0:
+            protoset = TransformationDataset(TensorDataset(torch.cat(x_protoset_cumuls), torch.cat(y_protoset_cumuls)), 
+                                            target_transform=None)
+            train_dataset = ConcatDataset((train_dataset, protoset))
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+                #######################here###############################
+        # Line 137: # Launch the training loop
+        # From lines: 69, 70, 76, 77
+        # Note optimizer == train_fn
+        # weight_decay == l2_penalty
+        # optimizer = torch.optim.SGD(model.parameters(), lr=sh_lr, weight_decay=wght_decay, momentum=0.9)
+        optimizer = torch.optim.Adam(model.parameters(), lr=sh_lr, weight_decay=wght_decay)
+        if args.binary:
+            train_fn = partial(make_theano_training_function_binary, model, criterion, optimizer, device=device)
+        elif args.mixup:
+            train_fn_mixup = partial(make_theano_training_function_mixup, model, criterion, optimizer, device=device)
+        elif args.label_smoothing:
+            train_fn_ls = partial(make_theano_training_function_ls, model, criterion, optimizer, device=device)
+        else:
+            train_fn = partial(make_theano_training_function, model, criterion, optimizer, device=device)
+        train_fn_add_binary = partial(make_theano_training_function_add_binary, model, criterion, optimizer, device=device)
+        scheduler = MultiStepLR(optimizer, lr_strat, gamma=0.3)
+
+        print("\n")
+
+        # Added (not found in original code): validation accuracy before first epoch
+        if args.binary:
+            acc_result, val_err, _, _ = get_accuracy_binary(model, task_info.get_current_test_set(),  device=device,
+                                                    required_top_k=[1], return_detailed_outputs=False,
+                                                    criterion=BCELoss(), make_one_hot=False, n_classes=2,
+                                                    batch_size=batch_size, shuffle=False, num_workers=1)
+        else:
+            acc_result, val_err, _, _ = get_accuracy(model, task_info.get_current_test_set(), device=device,
+                                                    required_top_k=[1, 2], return_detailed_outputs=False,
+                                                    criterion=BCELoss(), make_one_hot=True, n_classes=class_num,
+                                                    batch_size=batch_size, shuffle=False, num_workers=1)
+        print("Before first epoch")
+        print("  validation loss:\t\t{:.6f}".format(val_err))  # Note: already averaged
+        print("  top 1 accuracy:\t\t{:.2f} %".format(acc_result[0].item() * 100))
+        if not args.binary:
+            print("  top 2 accuracy:\t\t{:.2f} %".format(acc_result[1].item() * 100))
+        # End of added code
+
+        print('Batch of classes number {0} arrives ...'.format(task_idx + 1))
+
+
+        if task_idx == 0:
+            # model2 = make_icarl_net(100, n=n)
+            if args.binary:
+                model2 = Model_CNND(1, args)
+            else:
+                model2 = Model_CNND(class_num, args)
+            model2 = model2.to(device)
+            # noinspection PyTypeChecker
+            func_pred = partial(make_theano_inference_function, model2, device=device)
+
+            # Note: func_pred_feat is unused
+            # func_pred_feat = partial(make_theano_feature_extraction_function, model=model2,
+            #                          feature_extraction_layer='feature_extractor')
+
+        model2.load_state_dict(model.state_dict())
+
+                # Lines 216, 217: Save the network
+        
+        # torch.save(model.state_dict(), 'net_incr'+str(task_idx+1)+'_of_'+str(len(task_names)))
+        # torch.save(model.feature_extractor.state_dict(), 'intermed_incr'+str(task_idx+1)+'_of_'+str(len(task_names)))
+
+        save_p_model = save_path(args,'net_incr'+str(task_idx+1)+'_of_'+str(len(task_names)))
+        save_p_feature = save_path(args,'intermed_incr'+str(task_idx+1)+'_of_'+str(len(task_names)))
+        torch.save(model.state_dict(), save_p_model)
+        torch.save(model.feature_extractor.state_dict(), save_p_feature)
+
+
+        # Lines 220-242: Exemplars
+        # nb_protos_cl = int(ceil(nb_protos * len(task_names) * 2. / nb_cl / (task_idx + 1)))
+        # nb_protos_cl = int(ceil(1536. / nb_cl / (task_idx + 1)))
+        nb_protos_cl = int(ceil(nb_protos* 1. / nb_cl / (task_idx + 1)))
+
+        # Herding
+        print('Updating exemplar set...')
+        for iter_dico in range(nb_cl):
+            # Possible exemplars in the feature space and projected on the L2 sphere
+            prototypes_for_this_class, _ = task_info.swap_transformations() \
+                .get_current_training_set()[iter_dico*dictionary_size:(iter_dico+1)*dictionary_size]
+
+            mapped_prototypes: Tensor = function_map(prototypes_for_this_class)
+            D: Tensor = mapped_prototypes.T
+            D = D / torch.norm(D, dim=0)
+
+            # Herding procedure : ranking of the potential exemplars
+            mu = torch.mean(D, dim=1)
+            # alpha_dr_herding[task_idx, :, iter_dico] = alpha_dr_herding[task_idx, :, iter_dico] * 0
+            alpha_dr_herding_list[task_idx][ :, iter_dico] = alpha_dr_herding_list[task_idx][ :, iter_dico] * 0
+            w_t = mu
+            iter_herding = 0
+            iter_herding_eff = 0
+            # while not (torch.sum(alpha_dr_herding[task_idx, :, iter_dico] != 0) ==
+            #            min(nb_protos_cl, 500)) and iter_herding_eff < 1000:
+            #     tmp_t = torch.mm(w_t.unsqueeze(0), D)
+            #     ind_max = torch.argmax(tmp_t)
+            #     iter_herding_eff += 1
+            #     if alpha_dr_herding[task_idx, ind_max, iter_dico] == 0:
+            #         alpha_dr_herding[task_idx, ind_max, iter_dico] = 1 + iter_herding
+            #         iter_herding += 1
+            #     w_t = w_t + mu - D[:, ind_max]
+            while not (torch.sum(alpha_dr_herding_list[task_idx][ :, iter_dico] != 0) ==
+                       min(nb_protos_cl, 500)) and iter_herding_eff < 1000:
+                tmp_t = torch.mm(w_t.unsqueeze(0), D)
+                ind_max = torch.argmax(tmp_t)
+                iter_herding_eff += 1
+                if alpha_dr_herding_list[task_idx][ ind_max, iter_dico] == 0:
+                    alpha_dr_herding_list[task_idx][ ind_max, iter_dico] = 1 + iter_herding
+                    iter_herding += 1
+                w_t = w_t + mu - D[:, ind_max]            
+
+
+        # Lines 244-246: Prepare the protoset
+        x_protoset_cumuls: List[Tensor] = []
+        y_protoset_cumuls: List[Tensor] = []
+
+        # Lines 249-276: Class means for iCaRL and NCM + Storing the selected exemplars in the protoset
+        print('Computing mean-of_exemplars and theoretical mean...')
+        class_means = torch.zeros((2048, class_num, 2), dtype=torch.float)
+        for iteration2 in range(task_idx + 1):
+            dictionary_size = dictionary_size_list[iteration2]
+            for iter_dico in range(nb_cl):
+                prototypes_for_this_class: Tensor
+                current_cl = task_info.classes_seen_so_far[list(
+                    range(iteration2 * nb_cl, (iteration2 + 1) * nb_cl))]
+                current_class = current_cl[iter_dico].item()
+
+                prototypes_for_this_class, _ = task_info.swap_transformations().get_task_training_set(iteration2)[
+                                            iter_dico * dictionary_size:(iter_dico + 1)*dictionary_size]
+
+                # Collect data in the feature space for each class
+                mapped_prototypes: Tensor = function_map(prototypes_for_this_class)
+                D: Tensor = mapped_prototypes.T
+                D = D / torch.norm(D, dim=0)
+
+                # Flipped version also
+                # PyTorch doesn't support ::-1 yet
+                # And with "yet" I mean: PyTorch will NEVER support ::-1
+                # See: https://github.com/pytorch/pytorch/issues/229 (<-- year 2016!)
+                # Also: https://discuss.pytorch.org/t/torch-from-numpy-not-support-negative-strides/3663
+                mapped_prototypes2: Tensor = function_map(torch.from_numpy(
+                    prototypes_for_this_class.numpy()[:, :, :, ::-1].copy()))
+                D2: Tensor = mapped_prototypes2.T
+                D2 = D2 / torch.norm(D2, dim=0)
+
+                # iCaRL
+                # alph = alpha_dr_herding[iteration2, :, iter_dico]
+                alph = alpha_dr_herding_list[iteration2][ :, iter_dico]
+                alph = (alph > 0) * (alph < nb_protos_cl + 1) * 1.
+                print(torch.sum(alph == 1))
+
+                # Adds selected replay patterns
+                x_protoset_cumuls.append(prototypes_for_this_class[torch.where(alph == 1)[0]])
+                # Appends labels of replay patterns -> Tensor([current_class, current_class, current_class, ...])
+                y_protoset_cumuls.append(current_class * torch.ones(len(torch.where(alph == 1)[0])))
+                alph = alph / torch.sum(alph)
+                class_means[:, current_cl[iter_dico], 0] = (torch.mm(D, alph.unsqueeze(1)).squeeze(1) +
+                                                            torch.mm(D2, alph.unsqueeze(1)).squeeze(1)) / 2
+                class_means[:, current_cl[iter_dico], 0] /= torch.norm(class_means[:, current_cl[iter_dico], 0])
+
+                # Normal NCM
+                alph = torch.ones(dictionary_size) / dictionary_size
+                class_means[:, current_cl[iter_dico], 1] = (torch.mm(D, alph.unsqueeze(1)).squeeze(1) +
+                                                            torch.mm(D2, alph.unsqueeze(1)).squeeze(1)) / 2
+
+                class_means[:, current_cl[iter_dico], 1] /= torch.norm(class_means[:, current_cl[iter_dico], 1])
+
+
+        # torch.save(class_means, 'cl_means')  # Line 278
+
+        path_class_means = save_path(args,'cl_means')
+        torch.save(class_means, path_class_means)  # Line 278
+
+        # acc_table[task_idx] = OrderedDict()
+        # Calculate validation error of model on the first nb_cl classes:
+        print('Computing accuracy on the original batch of classes...')
+        for i in range(task_idx + 1):
+            if args.binary:
+                top1_acc_list_ori = icarl_accuracy_measure_binary(task_info.get_task_test_set(i), class_means, val_fn_binary,
+                                                        top1_acc_list_ori, task_idx, i, task_names[i],
+                                                        make_one_hot=False, n_classes=2,
+                                                        batch_size=batch_size, num_workers=2)
+
+            else:
+                top1_acc_list_ori = icarl_accuracy_measure(task_info.get_task_test_set(i), class_means, val_fn,
+                                                        top1_acc_list_ori, task_idx, i, task_names[i],
+                                                        make_one_hot=True, n_classes=class_num,
+                                                        batch_size=batch_size, num_workers=1)
+                print('Binary accuracy:')
+                top1_acc_list_ori = icarl_accuracy_measure_to_binary(task_info.get_task_test_set(i), class_means, val_fn, 
+                                                        top1_acc_list_ori, task_idx, i, task_names[i],
+                                                        make_one_hot=False, n_classes=class_num,
+                                                        batch_size=batch_size, num_workers=1)
+
+        if args.binary:
+            top1_acc_list_cumul = icarl_accuracy_measure_binary(task_info.get_cumulative_test_set(), class_means, val_fn_binary,
+                                                        top1_acc_list_cumul, task_idx, 0, 'cumul of',
+                                                        make_one_hot=False, n_classes=2,
+                                                        batch_size=batch_size, num_workers=1)
+        else:
+            top1_acc_list_cumul = icarl_accuracy_measure(task_info.get_cumulative_test_set(), class_means, val_fn,
+                                                        top1_acc_list_cumul, task_idx, 0, 'cumul of',
+                                                        make_one_hot=True, n_classes=class_num,
+                                                        batch_size=batch_size, num_workers=1)
+            print('Binary accuracy:')
+            top1_acc_list_cumul = icarl_accuracy_measure_to_binary(task_info.get_cumulative_test_set(), class_means, val_fn,
+                                                        top1_acc_list_cumul, task_idx, 0, 'binary cumul of',
+                                                        make_one_hot=False, n_classes=class_num,
+                                                        batch_size=batch_size, num_workers=1)
+    # Final save of the data
+    # torch.save(top1_acc_list_cumul, 'top1_acc_list_cumul_icarl_cl' + str(nb_cl))
+    # torch.save(top1_acc_list_ori, 'top1_acc_list_ori_icarl_cl' + str(nb_cl))
+    print(top1_acc_list_ori)
+    print(torch.mean(top1_acc_list_ori[-1],1))
+
+    path_acc_list_cum = save_path(args,'top1_acc_list_cumul_icarl_cl' + str(nb_cl))
+    path_acc_list_ori = save_path(args,'top1_acc_list_ori_icarl_cl' + str(nb_cl))
+    torch.save(top1_acc_list_cumul, path_acc_list_cum)
+    torch.save(top1_acc_list_ori, path_acc_list_ori)
+
+
+if __name__ == '__main__':
+    main()
+      
