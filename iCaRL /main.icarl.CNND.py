@@ -1,10 +1,34 @@
+import time
+from functools import partial
+from typing import Callable, Tuple, List
+from collections import OrderedDict
 
 import numpy as np
 import torch
+from math import ceil
+from torch import Tensor
+from torch.nn import BCELoss
+from torch.optim.lr_scheduler import MultiStepLR
+from torchvision.datasets.cifar import CIFAR100
+from cl_dataset_tools import NCProtocol, NCProtocolIterator, TransformationDataset
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, ConcatDataset
+import torchvision.transforms as transforms
+
+from cl_strategies import icarl_accuracy_measure, icarl_cifar100_augment_data
+from cl_strategies.icarl import icarl_accuracy_measure_to_binary, icarl_accuracy_measure_binary
+from models import make_icarl_net
+from cl_metrics_tools import get_accuracy, get_accuracy_binary
+from models.icarl_net import IcarlNet, initialize_icarl_net
+from utils import get_dataset_per_pixel_mean, make_theano_training_function, make_theano_validation_function,  \
+    make_theano_feature_extraction_function, make_theano_inference_function, make_batch_one_hot
+
 from options.train_options import TrainOptions
-
-
 from data import *
+from CNND_model import Model_CNND
+from options.train_options import TrainOptions
+from utils.theano_utils import make_theano_training_function_add_binary,make_theano_training_function_binary,make_theano_validation_function_binary,  \
+    make_theano_training_function_mixup,make_theano_training_function_ls,make_theano_validation_function_to_binary
 
 
 
@@ -68,4 +92,55 @@ def main():
         torch.cuda.manual_seed(SEED)
 
     train_dataset_splits = get_total_Data_multi(args)
+    val_opt = get_val_opt()
+    val_dataset_splits = get_total_Data_multi(val_opt)
+    task_output_space = get_tos_multi(args)
+    print(task_output_space)
+
+    task_names = args.task_name
+    print('Task order:', task_names)
+    task_num = len(task_names)
+    class_num = task_num*2
+
+    fixed_class_order = list(range(task_num*2))
+  
+    protocol = NCProtocol(train_dataset_splits,
+                          val_dataset_splits,
+                          n_tasks=len(task_names), shuffle=True, seed=None, fixed_class_order=fixed_class_order)
     
+    if args.binary:
+        model = Model_CNND(1, args)
+    else:
+        model = Model_CNND(class_num, args)
+    model = model.to(device)
+
+    criterion = BCELoss()  # Line 66-67
+
+    # Line 74, 75
+    # Note: sh_lr is a theano "shared"
+    sh_lr = lr_old
+
+    # noinspection PyTypeChecker
+    val_fn: Callable[[Tensor, Tensor],
+                     Tuple[Tensor, Tensor, Tensor]] = partial(make_theano_validation_function, model,
+                                                              BCELoss(), 'feature_extractor',
+                                                              device=device)
+
+    val_fn_to_binary: Callable[[Tensor, Tensor],
+                     Tuple[Tensor, Tensor, Tensor]] = partial(make_theano_validation_function_to_binary, model,
+                                                              BCELoss(), 'feature_extractor',
+                                                              device=device)
+    
+    val_fn_binary: Callable[[Tensor, Tensor],
+                    Tuple[Tensor, Tensor, Tensor]] = partial(make_theano_validation_function_binary, model,
+                                                            BCELoss(), 'feature_extractor',
+                                                            device=device)
+
+    # noinspection PyTypeChecker
+    function_map: Callable[[Tensor], Tensor] = partial(make_theano_feature_extraction_function, model,
+                                                       'feature_extractor', device=device, batch_size=batch_size)
+
+    # Lines 90-97: Initialization of the variables for this run
+    # dictionary_size = 500 ###????
+    
+
